@@ -513,7 +513,7 @@ function loadImage(file, max = 900) {
 
 /* ---------- Umleitungsserver (TURN) ---------- */
 /* Eingebettete Zugangsdaten (werden über "Verbindung → Datei erzeugen" eingesetzt) */
-const EMBED_TURN = /*QZ_TURN*/null/*QZ_TURN_END*/;
+const EMBED_TURN = /*QZ_TURN*/{"servers":[{"urls":"turn:global.relay.metered.ca:80","username":"92790f0d6adc33bc738d200d","credential":"So2bCpF+PEpZpOwK"},{"urls":"turn:global.relay.metered.ca:80?transport=tcp","username":"92790f0d6adc33bc738d200d","credential":"So2bCpF+PEpZpOwK"},{"urls":"turn:global.relay.metered.ca:443","username":"92790f0d6adc33bc738d200d","credential":"So2bCpF+PEpZpOwK"},{"urls":"turns:global.relay.metered.ca:443?transport=tcp","username":"92790f0d6adc33bc738d200d","credential":"So2bCpF+PEpZpOwK"}],"openrelay":true}/*QZ_TURN_END*/;
 const OPENRELAY_HOST = 'staticauth.openrelay.metered.ca', OPENRELAY_SECRET = 'openrelayprojectsecret';
 function turnConfig() { return Store.get('turn', null) || EMBED_TURN || {}; }
 async function openRelayServers() {
