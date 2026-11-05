@@ -7,7 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='%2314213d'/%3E%3Ccircle cx='10' cy='10' r='5' fill='%23ffb703'/%3E%3Ccircle cx='15' cy='15' r='3' fill='%2317a398'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;800;900&display=swap" rel="stylesheet">
-<style>
+<style id="qzstyle">
 :root{
   --ink:#14213d;--ink2:#1f2f56;--ink3:#2b3d6b;--paper:#f6f4ef;--line:#ddd7ca;
   --accent:#ffb703;--accent2:#fb8500;--ok:#2a9d5c;--bad:#d64045;--muted:#6b7280;
@@ -252,7 +252,7 @@ table.tbl{border-collapse:collapse;width:100%;background:#fff;border-radius:12px
 </head>
 <body>
 <div id="app"></div>
-<script>
+<script id="qzmain">
 'use strict';
 const A = {}, CH = {}, IH = {};
 /* ============ Quizzer: Kernfunktionen ============ */
@@ -511,6 +511,69 @@ function loadImage(file, max = 900) {
   });
 }
 
+/* ---------- Umleitungsserver (TURN) ---------- */
+/* Eingebettete Zugangsdaten (werden über "Verbindung → Datei erzeugen" eingesetzt) */
+const EMBED_TURN = /*QZ_TURN*/null/*QZ_TURN_END*/;
+const OPENRELAY_HOST = 'staticauth.openrelay.metered.ca', OPENRELAY_SECRET = 'openrelayprojectsecret';
+function turnConfig() { return Store.get('turn', null) || EMBED_TURN || {}; }
+async function openRelayServers() {
+  // Öffentlicher Zugang des Open-Relay-Projekts (zeitlich begrenzte Zugangsdaten nach TURN-REST-Verfahren)
+  const user = Math.floor(Date.now() / 1000 + 24 * 3600) + ':quizzer';
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(OPENRELAY_SECRET), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(user)));
+  const h = OPENRELAY_HOST;
+  return [{ urls: [`turn:${h}:80`, `turn:${h}:80?transport=tcp`, `turn:${h}:443`, `turn:${h}:443?transport=tcp`, `turns:${h}:443?transport=tcp`], username: user, credential: btoa(String.fromCharCode(...sig)) }];
+}
+async function fetchJson(url, ms = 6000) {
+  const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
+  try { const r = await fetch(url, { signal: c.signal }); if (!r.ok) throw new Error('HTTP ' + r.status); return await r.json(); } finally { clearTimeout(t); }
+}
+async function ownTurnServers(cfg = turnConfig()) {
+  if (cfg.apiUrl) { const j = await fetchJson(cfg.apiUrl); const arr = Array.isArray(j) ? j : j.iceServers; if (!Array.isArray(arr) || !arr.length) throw new Error('Keine Server in der Antwort'); return arr; }
+  if (Array.isArray(cfg.servers)) return cfg.servers;
+  return [];
+}
+let iceCache = null;
+async function resolveIce(force) {
+  if (!force && iceCache && Date.now() - iceCache.t < 30 * 60e3) return iceCache.s;
+  const cfg = turnConfig();
+  let list = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  try { list = list.concat(await ownTurnServers(cfg)); } catch (e) { console.warn('Eigener TURN-Zugang nicht erreichbar', e); }
+  if (cfg.openrelay !== false) { try { list = list.concat(await openRelayServers()); } catch (e) { console.warn('Open Relay nicht verfügbar', e); } }
+  iceCache = { t: Date.now(), s: list };
+  return list;
+}
+/* Prüft, ob über die Server eine Umleitung (relay) aufgebaut werden kann */
+function testRelay(servers, ms = 9000) {
+  return new Promise(res => {
+    if (!servers || !servers.length || !window.RTCPeerConnection) return res(false);
+    let pc, done = false;
+    const fin = v => { if (done) return; done = true; try { pc.close(); } catch (e) { } res(v); };
+    try {
+      pc = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: 'relay' });
+      pc.createDataChannel('t');
+      pc.onicecandidate = e => { if (e.candidate && / typ relay/.test(e.candidate.candidate)) fin(true); else if (!e.candidate) fin(false); };
+      pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => fin(false));
+      setTimeout(() => fin(false), ms);
+    } catch (e) { fin(false); }
+  });
+}
+/* Eigenen Zugang aus eingefügtem Text lesen: API-Link oder iceServers-Codeschnipsel */
+function parseTurnInput(txt) {
+  const t = String(txt || '').trim();
+  const api = t.match(/https:\/\/[\w.-]+\/api\/v1\/turn\/credentials\?apiKey=[\w-]+/);
+  if (api) return { apiUrl: api[0] };
+  try { const j = JSON.parse(t); const arr = Array.isArray(j) ? (j[0] && j[0].iceServers ? j[0].iceServers : j) : j.iceServers; if (Array.isArray(arr) && arr.length) return { servers: arr }; } catch (e) { }
+  const servers = [];
+  for (const block of t.split('}')) {
+    const urls = [...block.matchAll(/urls?\s*["']?\s*:\s*["']([^"']+)["']/g)].map(m => m[1]);
+    const u = block.match(/username\s*["']?\s*:\s*["']([^"']+)["']/), c = block.match(/credential\s*["']?\s*:\s*["']([^"']+)["']/);
+    if (urls.length && urls.some(x => /^turns?:/.test(x)) && u && c) servers.push({ urls: urls.length === 1 ? urls[0] : urls, username: u[1], credential: c[1] });
+  }
+  return servers.length ? { servers } : null;
+}
+
 /* ---------- Netzwerk (PeerJS oder lokal zum Testen) ---------- */
 function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error(src)); document.head.appendChild(s); }); }
 async function ensurePeer() {
@@ -525,7 +588,7 @@ const Net = {
     if (NET_LOCAL) return localHost(pin, h);
     return new Promise(async (res, rej) => {
       try { await ensurePeer(); } catch (e) { return rej(e); }
-      const peer = new Peer(PEER_PREFIX + pin, { debug: 0 });
+      const peer = new Peer(PEER_PREFIX + pin, { debug: 0, config: { iceServers: await resolveIce() } });
       let opened = false;
       peer.on('open', () => { opened = true; res({ close: () => { try { peer.destroy(); } catch (e) { } } }); });
       peer.on('error', e => { if (!opened) rej(e); else h.onError && h.onError(e); });
@@ -543,10 +606,10 @@ const Net = {
     if (NET_LOCAL) return localJoin(pin, h);
     return new Promise(async (res, rej) => {
       try { await ensurePeer(); } catch (e) { return rej(e); }
-      const peer = new Peer({ debug: 0 });
+      const peer = new Peer({ debug: 0, config: { iceServers: await resolveIce() } });
       let done = false;
       const fail = e => { if (!done) { done = true; clearTimeout(to); rej(e); try { peer.destroy(); } catch (x) { } } else h.onClose && h.onClose(); };
-      const to = setTimeout(() => fail(new Error('Keine Verbindung zum Spiel. Prüfe die PIN und das Internet.')), 15000);
+      const to = setTimeout(() => fail(new Error('Keine Verbindung zum Spiel. Prüfe die PIN. Klappt es weiter nicht, sag deiner Lehrkraft Bescheid.')), 25000);
       peer.on('error', e => fail(e && e.type === 'peer-unavailable' ? new Error('Kein Spiel mit dieser PIN gefunden.') : new Error('Verbindungsfehler: ' + (e && e.type || e))));
       peer.on('open', () => {
         const c = peer.connect(PEER_PREFIX + pin, { reliable: true });
@@ -766,7 +829,7 @@ function putReport(r) { const rs = getReports().filter(x => x.id !== r.id); rs.u
 function topbar(on = '') {
   const l = (h, t) => `<button class="${on === h ? 'on' : ''}" data-act="nav" data-to="${h}">${t}</button>`;
   return `<header class="topbar"><div class="logo" data-act="nav" data-to=""><span class="dot"></span><span>Quiz<b>zer</b></span></div>
-  <nav>${l('lehrkraft', 'Meine Quizze')}${l('import', 'Importieren')}${l('reports', 'Berichte')}${l('hweval', 'Hausaufgaben')}${l('hilfe', 'Anleitung')}</nav></header>`;
+  <nav>${l('lehrkraft', 'Meine Quizze')}${l('import', 'Importieren')}${l('reports', 'Berichte')}${l('hweval', 'Hausaufgaben')}${l('verbindung', 'Verbindung')}${l('hilfe', 'Anleitung')}</nav></header>`;
 }
 
 /* ---------- Bibliothek ---------- */
@@ -1253,6 +1316,66 @@ function viewHelp() {
   </div></main>`);
 }
 
+
+/* ---------- Verbindung / Umleitungsserver ---------- */
+function viewConnection() {
+  const local = Store.get('turn', null), cfg = turnConfig();
+  const own = cfg.apiUrl ? 'eigener Zugang per API-Link' : cfg.servers ? 'eigener Zugang (' + cfg.servers.length + ' Server)' : '';
+  const src = local ? 'nur in diesem Browser gespeichert' : EMBED_TURN ? 'fest in der Quizzer-Datei eingebaut' : '';
+  render(`${topbar('verbindung')}<main class="wrap" style="max-width:860px"><h1>Verbindung</h1>
+  <div class="card col">
+    <p>Im selben WLAN verbinden sich die Geräte direkt. Über <b>mobile Daten</b> oder in <b>Schulnetzen</b>, die direkte Verbindungen sperren, braucht Quizzer einen <b>Umleitungsserver</b> (TURN). Die Spieldaten laufen dann verschlüsselt über diesen Server. Quizzer probiert immer zuerst den direkten Weg.</p>
+    <h2>1. Eingebauter Umleitungsserver</h2>
+    <p class="small">Quizzer nutzt automatisch den öffentlichen, kostenlosen Zugang des Open-Relay-Projekts (metered.ca). Dafür brauchst du kein Konto.</p>
+    <label class="chk"><input type="checkbox" id="orOn" ${cfg.openrelay === false ? '' : 'checked'}><span>Eingebauten Umleitungsserver verwenden</span></label>
+    <div class="row"><button class="btn acc" data-act="conTest">🔌 Verbindung jetzt testen</button><span id="conRes" class="small"></span></div>
+    <h2 style="margin-top:1em">2. Eigener Zugang (nur falls der Test fehlschlägt)</h2>
+    ${own ? `<div class="pill ok">✓ Aktiv: ${esc(own)}, ${esc(src)}</div>` : ''}
+    <ol class="small">
+      <li>Kostenloses Konto anlegen auf <a href="https://dashboard.metered.ca/signup" target="_blank" rel="noopener">dashboard.metered.ca/signup</a> (enthält 20 GB Umleitung pro Monat; Quizzer braucht pro Spiel nur wenige hundert KB).</li>
+      <li>Im Dashboard eine App anlegen (Name beliebig, z. B. <code>quizzer</code>) und den Bereich <b>TURN Server</b> öffnen.</li>
+      <li>Dort den <b>API-Link</b> (beginnt mit <code>https://…metered.live/api/v1/turn/credentials?apiKey=</code>) oder den angezeigten Code mit <code>iceServers</code> kopieren und hier einfügen.</li>
+    </ol>
+    <textarea id="turnIn" rows="5" placeholder="API-Link oder Code mit iceServers hier einfügen"></textarea>
+    <div class="row"><button class="btn sec" data-act="conSave">Prüfen und speichern</button>${local ? '<button class="btn sec sm" data-act="conClear">Eigenen Zugang entfernen</button>' : ''}</div>
+    <h2 style="margin-top:1em">3. Für alle Geräte übernehmen</h2>
+    <p class="small">Damit auch die Geräte der Klasse deinen eigenen Zugang nutzen, muss er in der Quizzer-Datei stecken. Lade dazu die Datei hier herunter und ersetze damit <code>index.html</code> bei GitHub (Add file → Upload files). Für den eingebauten Umleitungsserver ist das nicht nötig.</p>
+    <button class="btn sec" data-act="conExport" ${local ? '' : 'disabled'}>⬇ index.html mit eigenem Zugang herunterladen</button>
+    <p class="small muted">Hinweis: Die Zugangsdaten sind danach in der öffentlichen Datei lesbar. Im ungünstigsten Fall verbraucht jemand anderes dein Freikontingent; Kosten entstehen im kostenlosen Tarif nicht.</p>
+  </div></main>`);
+}
+function selfHtml(scriptText) {
+  const fav = $('link[rel=icon]')?.getAttribute('href') || '';
+  return `<!DOCTYPE html>\n<html lang="de">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Quizzer</title>\n<link rel="icon" href="${fav}">\n<link rel="preconnect" href="https://fonts.googleapis.com">\n<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;800;900&display=swap" rel="stylesheet">\n<style id="qzstyle">${$('#qzstyle').textContent}</style>\n</head>\n<body>\n<div id="app"></div>\n<script id="qzmain">${scriptText}</` + `script>\n</body>\n</html>\n`;
+}
+CH.orOn = el => { const c = Object.assign({}, Store.get('turn', null) || EMBED_TURN || {}); c.openrelay = el.checked; Store.set('turn', c); iceCache = null; toast(el.checked ? 'Eingebauter Server an' : 'Eingebauter Server aus'); };
+Object.assign(A, {
+  async conTest() {
+    const out = $('#conRes'); out.textContent = '⏳ teste … (bis zu 10 Sekunden)';
+    const cfg = turnConfig(), parts = [];
+    if (cfg.openrelay !== false) { let ok = false; try { ok = await testRelay(await openRelayServers()); } catch (e) { } parts.push(ok ? '✅ Eingebauter Server funktioniert' : '❌ Eingebauter Server nicht erreichbar'); }
+    if (cfg.apiUrl || cfg.servers) { let ok = false; try { ok = await testRelay(await ownTurnServers(cfg)); } catch (e) { } parts.push(ok ? '✅ Eigener Zugang funktioniert' : '❌ Eigener Zugang nicht erreichbar'); }
+    if (!parts.length) parts.push('⚠️ Kein Umleitungsserver eingeschaltet: Spielen klappt nur im selben WLAN.');
+    out.innerHTML = parts.join('<br>') + '<br><span class="muted">Teste am besten in dem Netz, in dem du spielen willst (z. B. Schul-WLAN).</span>';
+    iceCache = null;
+  },
+  async conSave() {
+    const c = parseTurnInput($('#turnIn').value);
+    if (!c) return toast('Kein API-Link und keine Zugangsdaten erkannt.', 'bad');
+    toast('Prüfe Zugang …');
+    let ok = false; try { ok = await testRelay(await ownTurnServers(c)); } catch (e) { }
+    if (!ok && !await confirmBox('Der Zugang konnte gerade nicht bestätigt werden. Trotzdem speichern?', 'Speichern', 'acc')) return;
+    c.openrelay = turnConfig().openrelay !== false;
+    Store.set('turn', c); iceCache = null; toast(ok ? 'Zugang funktioniert und ist gespeichert' : 'Gespeichert', 'ok'); viewConnection();
+  },
+  async conClear() { if (await confirmBox('Eigenen Zugang aus diesem Browser entfernen?', 'Entfernen')) { Store.set('turn', null); iceCache = null; viewConnection(); } },
+  conExport() {
+    const c = Store.get('turn', null); if (!c) return;
+    const src = $('#qzmain').textContent.replace(/\/\*QZ_TURN\*\/[\s\S]*?\/\*QZ_TURN_END\*\//, '/*QZ_TURN*/' + JSON.stringify(c).replace(/</g, '\\u003c') + '/*QZ_TURN_END*/');
+    download('index.html', selfHtml(src), 'text/html');
+  },
+});
+
 /* ============ Live-Spiel: Lehrkraft (Host) ============ */
 let G = null;
 const colorIdx = (type, i) => type === 'tf' ? [3, 0][i] : i;
@@ -1411,9 +1534,14 @@ async function renderLobby() {
     <div class="bigcount" id="lobbyCount"></div>
     <div class="players" id="lobbyPlayers"></div>
     <button class="btn acc lg" data-act="hStart" id="startBtn" data-next>Start ▶</button>
+    <div class="small" id="relayInfo" style="opacity:.85">🛰️ Prüfe Umleitungsserver …</div>
     <div class="small" style="opacity:.7">${s.team ? '👥 Teammodus' : '👤 Einzeln'} · ${G.order.length} Fragen${s.nick ? ' · Namens-Generator' : ''}${s.read ? ' · ' + s.read + ' s ' + (s.team ? 'Besprechung' : 'Lesezeit') : ''} · Klick auf einen Namen entfernt die Person</div>
   </div></div>`);
   renderLobbyPlayers();
+  resolveIce().then(list => testRelay(list.filter(x => /turns?:/.test(JSON.stringify(x.urls))))).then(ok => {
+    const el = $('#relayInfo'); if (!el) return;
+    el.innerHTML = ok ? '🛰️ Umleitungsserver bereit: Beitreten auch über mobile Daten und Schulnetz möglich' : '⚠️ Umleitungsserver nicht erreichbar: Beitreten klappt evtl. nur im selben WLAN. <a href="#verbindung" style="color:#ffb703" target="_blank">Verbindung prüfen</a>';
+  });
   const svg = await makeQR(url, 4), el = $('#lobbyQr');
   if (el) { if (svg) el.innerHTML = svg; else el.remove(); }
 }
@@ -1877,6 +2005,7 @@ function route() {
   if (h.startsWith('report-')) return viewReport(h.slice(7));
   if (h === 'hweval') return viewHwEval();
   if (h === 'hilfe') return viewHelp();
+  if (h === 'verbindung') return viewConnection();
   if (P && P.phase !== 'closed' && P.phase !== 'end') { try { P.net && P.net.close(); } catch (e) { } P = null; }
   viewHome();
 }
